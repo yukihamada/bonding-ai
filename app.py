@@ -76,7 +76,7 @@ TTS_CURRENT_MODEL = "edge-tts-nanami"
 MOSHI_REPO   = "akkikiki/j-moshi-ext-mlx-q4"  # 日本語Moshi q4 (5GB, 確認済動作)
 MOSHI_QUANT  = 4
 
-MODE = "moshi"      # "pipeline" | "moshi" | "hybrid"
+MODE = "hybrid"      # "pipeline" | "moshi" | "hybrid"
 
 # ── 利用可能 Moshi/S2S モデル一覧 ────────────────────────────────────
 MOSHI_MODELS = {
