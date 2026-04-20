@@ -604,8 +604,11 @@ class MoshiBridge:
                "--hf-repo", MOSHI_REPO, "--port", "8998", "--no-browser"]
         if MOSHI_QUANT:
             cmd += ["-q", str(MOSHI_QUANT)]
+        import os as _os
+        moshi_env = {**_os.environ, "PYTHONHASHSEED": "random"}  # F5-TTS汚染を防ぐ
         self.proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=moshi_env
         )
         # subprocess stdout を別タスクで流しっぱなしにする（読み捨て）
         async def _drain():
