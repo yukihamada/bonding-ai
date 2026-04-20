@@ -581,7 +581,7 @@ class MoshiBridge:
     def pause(self):
         """MoshiプロセスをSIGSTOPで一時停止 → GPU完全解放"""
         import os, signal
-        if self.proc and self.proc.poll() is None:
+        if self.proc and self.proc.returncode is None:
             try:
                 os.kill(self.proc.pid, signal.SIGSTOP)
                 print("[moshi] paused (SIGSTOP)", flush=True)
@@ -591,7 +591,7 @@ class MoshiBridge:
     def resume(self):
         """MoshiプロセスをSIGCONTで再開"""
         import os, signal
-        if self.proc and self.proc.poll() is None:
+        if self.proc and self.proc.returncode is None:
             try:
                 os.kill(self.proc.pid, signal.SIGCONT)
                 print("[moshi] resumed (SIGCONT)", flush=True)
