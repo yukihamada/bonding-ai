@@ -1618,6 +1618,7 @@ function connect() {
     if (msg.type === 'speaking') {
       orb.classList.toggle('speaking', msg.on);
       orb.textContent = msg.on ? '🗣️' : '✨';
+      if (msg.on && moshiCtx) moshiPlayTime = moshiCtx.currentTime; // Moshiキューをフラッシュ
     }
   };
   ws.onclose = () => { status.textContent = '再接続中...'; setTimeout(connect, 2000); };
