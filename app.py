@@ -22,7 +22,7 @@ VAD_THRESH   = 0.015
 MLX_LM_REPO  = "mlx-community/Qwen3.5-122B-A10B-4bit"  # 122B MoE (10B active) = でかい&高速
 WHISPER_REPO = "mlx-community/whisper-large-v3-turbo"  # turbo版（large-v3の5x高速）
 TTS_VOICE    = "ja-JP-NanamiNeural"
-TTS_MODE     = "edge-tts"   # "edge-tts" | "kokoro" | "f5tts"
+TTS_MODE     = "kokoro"   # "edge-tts" | "kokoro" | "f5tts"
 KOKORO_VOICE = "jf_alpha"   # jf_alpha/jf_gongitsune/jf_nezumi/jf_tebukuro/jm_kumo
 KOKORO_REPO  = "mlx-community/Kokoro-82M-bf16"
 
@@ -836,9 +836,7 @@ async def _tts_to_pcm24k(text: str) -> bytes:
     return audio.astype(np.float32).tobytes()
 
 async def _ws_hybrid(ws):
-    """Moshi（即座の相槌）+ Pipeline（質の高い本応答）ハイブリッドモード"""
-    global _moshi_bridge
-
+    """Pipeline + filler TTS（Moshi削除でGPU競合解消）"""
     if not _model_ready:
         await ws.send_json({"type": "status", "text": "⏳ Qwen3.5 読み込み中..."})
         while not _model_ready:
@@ -853,21 +851,9 @@ async def _ws_hybrid(ws):
     history = [{"role": "system", "content": SYSTEM_PROMPT + user_memory}]
     save_turn(session_id, "assistant", greeting)
 
-    # Moshi起動
-    if _moshi_bridge is None:
-        _moshi_bridge = MoshiBridge()
-        await _moshi_bridge.start(ws)
-    else:
-        await ws.send_json({"type": "status", "text": "Moshi 準備完了"})
-
     await ws.send_json({"type": "ai", "text": greeting})
-    # 挨拶はedge-ttsで再生（Moshi声が出るまでの間）
     threading.Thread(target=speak, args=(greeting, ws), daemon=True).start()
 
-    mute_flag = {"on": False}
-    # Moshi声を自動収集（10秒分集まったらF5-TTSに切り替え）
-    voice_capture = {"chunks": [], "done": Path(MOSHI_VOICE_SAMPLE).exists(), "target_secs": 10.0}
-    recv_task = asyncio.create_task(_moshi_bridge.recv_loop(ws, mute_flag, voice_capture, hide_text=True))
     vad = VADBuffer()
     num_turns = 0
     total_user_chars = 0
@@ -878,39 +864,25 @@ async def _ws_hybrid(ws):
             if msg.type == aiohttp.WSMsgType.BINARY:
                 pcm = np.frombuffer(msg.data, dtype=np.float32)
 
-                # Moshiへ送信（常時）
-                if _moshi_bridge and _moshi_bridge.ready:
-                    await asyncio.get_event_loop().run_in_executor(None, _moshi_bridge.feed_pcm, pcm)
-
-                # PipelineVAD（Moshi再生中は無視）
-                if mute_flag["on"]: continue
+                if pipeline_lock.locked(): continue
                 audio = vad.push(pcm)
                 if audio is None: continue
 
-                # Pipeline処理（同時実行しない）
-                if pipeline_lock.locked(): continue
                 async with pipeline_lock:
+                    import random as _random
                     t0 = time.time()
-                    # VAD発火と同時にMoshiをミュート（「はいはい」が連続するのを防ぐ）
-                    mute_flag["on"] = True
                     print(f"[hybrid] VAD triggered audio={len(audio)}", flush=True)
                     await ws.send_json({"type": "status", "text": "認識中..."})
 
-                    # STT + フィラーTTS を並行実行（7-9秒の無音を緩和）
-                    import random as _random
-                    _FILLERS = ["うん。", "なるほど。", "そっか。", "ふむ。", "へえ。"]
-                    _filler = _random.choice(_FILLERS)
-
-                    async def _stt():
-                        return await asyncio.get_event_loop().run_in_executor(None, transcribe, audio)
-                    async def _filler_tts():
-                        return await _tts_to_pcm24k(_filler)
-
-                    user_text, filler_pcm = await asyncio.gather(_stt(), _filler_tts())
+                    # STT + filler TTS 並行実行
+                    _filler = _random.choice(["うん。", "なるほど。", "そっか。", "ふむ。", "へえ。"])
+                    user_text, filler_pcm = await asyncio.gather(
+                        asyncio.get_event_loop().run_in_executor(None, transcribe, audio),
+                        _tts_to_pcm24k(_filler),
+                    )
                     t_stt = time.time()
                     print(f"[hybrid] STT {t_stt-t0:.1f}s: '{user_text[:40] if user_text else 'EMPTY'}'", flush=True)
 
-                    # フィラーをブラウザへ送信
                     _CHUNK = 1920 * 4
                     await ws.send_json({"type": "speaking", "on": True})
                     for _i in range(0, len(filler_pcm), _CHUNK):
@@ -919,7 +891,6 @@ async def _ws_hybrid(ws):
 
                     if not user_text:
                         await ws.send_json({"type": "speaking", "on": False})
-                        mute_flag["on"] = False
                         continue
 
                     num_turns += 1; total_user_chars += len(user_text)
@@ -928,7 +899,6 @@ async def _ws_hybrid(ws):
                     await ws.send_json({"type": "status", "text": "考え中..."})
 
                     sentence_q: queue.Queue = queue.Queue()
-                    reply_container = [None]
                     first_sentence_time = [None]
 
                     def _gen():
@@ -938,16 +908,14 @@ async def _ws_hybrid(ws):
                                     first_sentence_time[0] = time.time()
                                     print(f"[hybrid] LLM 1st sentence {first_sentence_time[0]-t0:.1f}s: {s[:30]}", flush=True)
                                 sentence_q.put(s)
-                            reply_container[0] = llm_respond_streaming(user_text, history, on_sent)
+                            llm_respond_streaming(user_text, history, on_sent)
                         except Exception as e:
                             print(f"[hybrid] LLM error: {e}", flush=True)
                         finally:
                             sentence_q.put(None)
 
-                    gen_thread = threading.Thread(target=_gen, daemon=True)
-                    gen_thread.start()
+                    threading.Thread(target=_gen, daemon=True).start()
 
-                    # 文ごとにTTS→PCM24k→クライアントへ送信
                     full_reply = []
                     t_first_audio = None
                     while True:
@@ -965,15 +933,13 @@ async def _ws_hybrid(ws):
                             if t_first_audio is None:
                                 t_first_audio = time.time()
                                 print(f"[hybrid] 1st audio {t_first_audio-t0:.1f}s", flush=True)
-                            # 1920サンプル(80ms)ずつ送信
-                            CHUNK = 1920 * 4  # float32 = 4bytes
+                            CHUNK = 1920 * 4
                             for i in range(0, len(pcm_bytes), CHUNK):
                                 await ws.send_bytes(pcm_bytes[i:i+CHUNK])
                                 await asyncio.sleep(0.075)
                         except Exception as e:
                             print(f"[hybrid] TTS error: {e}", flush=True)
 
-                    gen_thread.join(timeout=5)
                     reply = " ".join(full_reply)
                     save_turn(session_id, "assistant", reply)
                     await ws.send_json({"type": "ai", "text": reply})
@@ -984,30 +950,9 @@ async def _ws_hybrid(ws):
                     t_done = time.time()
                     print(f"[hybrid] total {t_done-t0:.1f}s | STT:{t_stt-t0:.1f}s LLM:{(first_sentence_time[0] or t_done)-t0:.1f}s audio:{(t_first_audio or t_done)-t0:.1f}s", flush=True)
 
-                    mute_flag["on"] = False  # Moshi再開
-
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 break
     finally:
-        recv_task.cancel()
-        mute_flag["on"] = False
-        # 声サンプルが集まっていたら保存してF5-TTSに切り替え
-        if not voice_capture["done"] and voice_capture["chunks"]:
-            import soundfile as sf
-            audio = np.concatenate(voice_capture["chunks"])
-            rms = float(np.sqrt(np.mean(audio**2)))
-            if rms > 0.005 and len(audio) / MOSHI_RATE >= 3.0:
-                Path(MOSHI_VOICE_SAMPLE).parent.mkdir(parents=True, exist_ok=True)
-                sf.write(MOSHI_VOICE_SAMPLE, audio, MOSHI_RATE)
-                print(f"[voice_capture] 保存: {MOSHI_VOICE_SAMPLE} ({len(audio)/MOSHI_RATE:.1f}秒 RMS={rms:.4f})", flush=True)
-                voice_capture["done"] = True
-                # ref_text をWhisperで生成して保存
-                threading.Thread(target=load_f5tts, daemon=True).start()
-        if voice_capture["done"] and Path(MOSHI_VOICE_SAMPLE).exists():
-            global TTS_MODE, TTS_CURRENT_MODEL
-            TTS_MODE = "f5tts"
-            TTS_CURRENT_MODEL = "f5tts-moshi-clone"
-            print("[voice_capture] F5-TTSボイスクローンに切り替え", flush=True)
         if num_turns >= 2:
             def _extract():
                 facts = _extract_facts_sync(history)
