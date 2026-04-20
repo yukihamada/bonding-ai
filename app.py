@@ -19,7 +19,7 @@ MOSHI_RATE   = 24000
 FRAME_SIZE   = 1920          # 80ms @ 24kHz
 VAD_SILENCE  = 0.8       # 発話終了判定を短縮（1.5→0.8秒）
 VAD_THRESH   = 0.015
-MLX_LM_REPO  = "mlx-community/Qwen3.5-122B-A10B-4bit"  # 122B MoE (10B active) = でかい&高速
+MLX_LM_REPO  = "mlx-community/Qwen3-8B-4bit"  # 8B (4GB) Moshi+Whisperと共存
 WHISPER_REPO = "mlx-community/whisper-large-v3-turbo"  # turbo版（large-v3の5x高速）
 TTS_VOICE    = "ja-JP-NanamiNeural"
 TTS_MODE     = "kokoro"   # "edge-tts" | "kokoro" | "f5tts"
@@ -836,9 +836,11 @@ async def _tts_to_pcm24k(text: str) -> bytes:
     return audio.astype(np.float32).tobytes()
 
 async def _ws_hybrid(ws):
-    """Pipeline + filler TTS（Moshi削除でGPU競合解消）"""
+    """Moshi（即座の相槌）+ Pipeline（Qwen3-8B）ハイブリッド"""
+    global _moshi_bridge
+
     if not _model_ready:
-        await ws.send_json({"type": "status", "text": "⏳ Qwen3.5 読み込み中..."})
+        await ws.send_json({"type": "status", "text": "⏳ モデル読み込み中..."})
         while not _model_ready:
             await asyncio.sleep(2)
 
@@ -851,9 +853,19 @@ async def _ws_hybrid(ws):
     history = [{"role": "system", "content": SYSTEM_PROMPT + user_memory}]
     save_turn(session_id, "assistant", greeting)
 
+    if _moshi_bridge is None:
+        _moshi_bridge = MoshiBridge()
+        await _moshi_bridge.start(ws)
+    else:
+        await ws.send_json({"type": "status", "text": "Moshi 準備完了"})
+
     await ws.send_json({"type": "ai", "text": greeting})
     threading.Thread(target=speak, args=(greeting, ws), daemon=True).start()
 
+    mute_flag = {"on": False}
+    recv_task = asyncio.create_task(
+        _moshi_bridge.recv_loop(ws, mute_flag, voice_capture=None, hide_text=True)
+    )
     vad = VADBuffer()
     num_turns = 0
     total_user_chars = 0
@@ -864,13 +876,18 @@ async def _ws_hybrid(ws):
             if msg.type == aiohttp.WSMsgType.BINARY:
                 pcm = np.frombuffer(msg.data, dtype=np.float32)
 
-                if pipeline_lock.locked(): continue
+                # Moshiへ常時送信
+                if _moshi_bridge and _moshi_bridge.ready:
+                    await asyncio.get_event_loop().run_in_executor(None, _moshi_bridge.feed_pcm, pcm)
+
+                if mute_flag["on"] or pipeline_lock.locked(): continue
                 audio = vad.push(pcm)
                 if audio is None: continue
 
                 async with pipeline_lock:
                     import random as _random
                     t0 = time.time()
+                    mute_flag["on"] = True  # VAD発火でMoshi即ミュート
                     print(f"[hybrid] VAD triggered audio={len(audio)}", flush=True)
                     await ws.send_json({"type": "status", "text": "認識中..."})
 
@@ -891,6 +908,7 @@ async def _ws_hybrid(ws):
 
                     if not user_text:
                         await ws.send_json({"type": "speaking", "on": False})
+                        mute_flag["on"] = False
                         continue
 
                     num_turns += 1; total_user_chars += len(user_text)
@@ -949,10 +967,13 @@ async def _ws_hybrid(ws):
 
                     t_done = time.time()
                     print(f"[hybrid] total {t_done-t0:.1f}s | STT:{t_stt-t0:.1f}s LLM:{(first_sentence_time[0] or t_done)-t0:.1f}s audio:{(t_first_audio or t_done)-t0:.1f}s", flush=True)
+                    mute_flag["on"] = False
 
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 break
     finally:
+        recv_task.cancel()
+        mute_flag["on"] = False
         if num_turns >= 2:
             def _extract():
                 facts = _extract_facts_sync(history)
