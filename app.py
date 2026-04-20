@@ -22,7 +22,7 @@ VAD_THRESH   = 0.015
 MLX_LM_REPO  = "mlx-community/Qwen3.5-122B-A10B-4bit"  # 122B MoE (10B active) = でかい&高速
 WHISPER_REPO = "mlx-community/whisper-large-v3-turbo"  # turbo版（large-v3の5x高速）
 TTS_VOICE    = "ja-JP-NanamiNeural"
-TTS_MODE     = "edge-tts"   # "edge-tts" | "kokoro"
+TTS_MODE     = "kokoro"   # "edge-tts" | "kokoro" | "f5tts"
 KOKORO_VOICE = "jf_alpha"   # jf_alpha/jf_gongitsune/jf_nezumi/jf_tebukuro/jm_kumo
 KOKORO_REPO  = "mlx-community/Kokoro-82M-bf16"
 
@@ -786,13 +786,27 @@ async def _ws_moshi(ws):
         })
 
 async def _tts_to_pcm24k(text: str) -> bytes:
-    """TTS→PCM float32 24kHz bytes (F5-TTSまたはedge-tts)"""
+    """TTS→PCM float32 24kHz bytes"""
     import soundfile as sf
     from scipy.signal import resample_poly
-    import math
+    import math, shutil
+
+    if TTS_MODE == "kokoro":
+        wav_path, outdir = await asyncio.get_event_loop().run_in_executor(
+            None, _kokoro_tts_sync, text
+        )
+        if wav_path:
+            audio, sr = sf.read(wav_path)
+            shutil.rmtree(outdir, ignore_errors=True)
+            if audio.ndim > 1: audio = audio.mean(axis=1)
+            if sr != 24000:
+                g = math.gcd(24000, int(sr))
+                audio = resample_poly(audio, 24000 // g, sr // g)
+            return audio.astype(np.float32).tobytes()
+        shutil.rmtree(outdir, ignore_errors=True)
+        # fallthrough to edge-tts
 
     if TTS_MODE == "f5tts" and _f5tts_model is not None:
-        # F5-TTS ボイスクローン（キャッシュ済みモデル使用）
         try:
             def _f5():
                 wav, sr, _ = _f5tts_model.infer(
@@ -804,7 +818,7 @@ async def _tts_to_pcm24k(text: str) -> bytes:
             wav, sr = await asyncio.get_event_loop().run_in_executor(None, _f5)
             audio = np.array(wav, dtype=np.float32)
             if sr != 24000:
-                g = math.gcd(24000, sr)
+                g = math.gcd(24000, int(sr))
                 audio = resample_poly(audio, 24000 // g, sr // g)
             return audio.astype(np.float32).tobytes()
         except Exception as e:
@@ -816,7 +830,7 @@ async def _tts_to_pcm24k(text: str) -> bytes:
     os.unlink(mp3)
     if audio.ndim > 1: audio = audio.mean(axis=1)
     if sr != 24000:
-        g = math.gcd(24000, sr)
+        g = math.gcd(24000, int(sr))
         audio = resample_poly(audio, 24000 // g, sr // g)
     return audio.astype(np.float32).tobytes()
 
