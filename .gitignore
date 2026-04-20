@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+conversations/
+*.wav
+*.mp3
+*.log
+.DS_Store
