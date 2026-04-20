@@ -22,7 +22,7 @@ VAD_THRESH   = 0.015
 MLX_LM_REPO  = "mlx-community/Qwen3.5-122B-A10B-4bit"  # 122B MoE (10B active) = でかい&高速
 WHISPER_REPO = "mlx-community/whisper-large-v3-turbo"  # turbo版（large-v3の5x高速）
 TTS_VOICE    = "ja-JP-NanamiNeural"
-TTS_MODE     = "kokoro"   # "edge-tts" | "kokoro" | "f5tts"
+TTS_MODE     = "edge-tts"   # "edge-tts" | "kokoro" | "f5tts"
 KOKORO_VOICE = "jf_alpha"   # jf_alpha/jf_gongitsune/jf_nezumi/jf_tebukuro/jm_kumo
 KOKORO_REPO  = "mlx-community/Kokoro-82M-bf16"
 
@@ -363,8 +363,9 @@ def load_pipeline_models():
     except Exception as e:
         print(f"[warn] Whisper warmup skipped: {e}", flush=True)
 
-    # F5-TTS ボイスクローン（声サンプルがあれば起動時にロード）
-    load_f5tts()
+    # F5-TTS: edge-tts/kokoro使用時はロードしない（メモリ競合を防ぐ）
+    if TTS_MODE == "f5tts":
+        load_f5tts()
 
 def transcribe(audio_np):
     import mlx_whisper
