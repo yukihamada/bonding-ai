@@ -27,6 +27,7 @@ KOKORO_VOICE = "jf_alpha"   # jf_alpha/jf_gongitsune/jf_nezumi/jf_tebukuro/jm_ku
 KOKORO_REPO  = "mlx-community/Kokoro-82M-bf16"
 
 MOSHI_VOICE_SAMPLE = "conversations/moshi_voice_sample.wav"
+MOSHI_VOICE_REF_TEXT = "conversations/moshi_voice_ref.txt"
 
 TTS_MODELS = {
     "edge-tts-nanami": {
@@ -304,6 +305,38 @@ Set3: 私たちで始まる文3つ→分かち合いたいこと→親友にな�
 
 # ── Pipeline: モデル ──────────────────────────────────────────────
 _lm_model = _lm_tokenizer = None
+_f5tts_model = None  # F5-TTS キャッシュ（起動時ロード）
+_f5tts_ref_text = ""
+
+def load_f5tts():
+    global _f5tts_model, _f5tts_ref_text, TTS_MODE, TTS_CURRENT_MODEL
+    if not Path(MOSHI_VOICE_SAMPLE).exists():
+        return
+    try:
+        import torch, math, numpy as np
+        from f5_tts.api import F5TTS
+        from scipy.signal import resample_poly
+        import soundfile as sf
+        print("F5-TTS ロード中...", flush=True)
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        _f5tts_model = F5TTS(device=device)
+        # ref_text: 保存済みなら読込、なければWhisperで生成
+        if Path(MOSHI_VOICE_REF_TEXT).exists():
+            _f5tts_ref_text = Path(MOSHI_VOICE_REF_TEXT).read_text().strip()
+        else:
+            import mlx_whisper
+            data, sr = sf.read(MOSHI_VOICE_SAMPLE)
+            g = math.gcd(16000, int(sr))
+            data16 = resample_poly(data, 16000 // g, sr // g).astype(np.float32)
+            _f5tts_ref_text = mlx_whisper.transcribe(
+                data16, path_or_hf_repo=WHISPER_REPO, language="ja"
+            )["text"].strip()
+            Path(MOSHI_VOICE_REF_TEXT).write_text(_f5tts_ref_text)
+        TTS_MODE = "f5tts"
+        TTS_CURRENT_MODEL = "f5tts-moshi-clone"
+        print(f"✓ F5-TTS ready (ref: {_f5tts_ref_text[:30]})", flush=True)
+    except Exception as e:
+        print(f"[f5tts] ロード失敗: {e}", flush=True)
 
 def load_pipeline_models():
     global _lm_model, _lm_tokenizer
@@ -329,6 +362,9 @@ def load_pipeline_models():
             print(f"[warn] Whisper warmup: {result.stderr[-100:]}", flush=True)
     except Exception as e:
         print(f"[warn] Whisper warmup skipped: {e}", flush=True)
+
+    # F5-TTS ボイスクローン（声サンプルがあれば起動時にロード）
+    load_f5tts()
 
 def transcribe(audio_np):
     import mlx_whisper
@@ -755,17 +791,13 @@ async def _tts_to_pcm24k(text: str) -> bytes:
     from scipy.signal import resample_poly
     import math
 
-    if TTS_MODE == "f5tts" and Path(MOSHI_VOICE_SAMPLE).exists():
-        # F5-TTS ボイスクローン（MPS加速）
+    if TTS_MODE == "f5tts" and _f5tts_model is not None:
+        # F5-TTS ボイスクローン（キャッシュ済みモデル使用）
         try:
             def _f5():
-                import torch
-                from f5_tts.api import F5TTS
-                device = "mps" if torch.backends.mps.is_available() else "cpu"
-                tts = F5TTS(device=device)
-                wav, sr, _ = tts.infer(
+                wav, sr, _ = _f5tts_model.infer(
                     ref_file=MOSHI_VOICE_SAMPLE,
-                    ref_text="",
+                    ref_text=_f5tts_ref_text,
                     gen_text=text,
                 )
                 return wav, sr
@@ -954,6 +986,8 @@ async def _ws_hybrid(ws):
                 sf.write(MOSHI_VOICE_SAMPLE, audio, MOSHI_RATE)
                 print(f"[voice_capture] 保存: {MOSHI_VOICE_SAMPLE} ({len(audio)/MOSHI_RATE:.1f}秒 RMS={rms:.4f})", flush=True)
                 voice_capture["done"] = True
+                # ref_text をWhisperで生成して保存
+                threading.Thread(target=load_f5tts, daemon=True).start()
         if voice_capture["done"] and Path(MOSHI_VOICE_SAMPLE).exists():
             global TTS_MODE, TTS_CURRENT_MODEL
             TTS_MODE = "f5tts"
