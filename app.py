@@ -844,21 +844,41 @@ async def _ws_hybrid(ws):
                 if pipeline_lock.locked(): continue
                 async with pipeline_lock:
                     t0 = time.time()
+                    # VAD発火と同時にMoshiをミュート（「はいはい」が連続するのを防ぐ）
+                    mute_flag["on"] = True
                     print(f"[hybrid] VAD triggered audio={len(audio)}", flush=True)
                     await ws.send_json({"type": "status", "text": "認識中..."})
 
-                    user_text = await asyncio.get_event_loop().run_in_executor(None, transcribe, audio)
+                    # STT + フィラーTTS を並行実行（7-9秒の無音を緩和）
+                    import random as _random
+                    _FILLERS = ["うん。", "なるほど。", "そっか。", "ふむ。", "へえ。"]
+                    _filler = _random.choice(_FILLERS)
+
+                    async def _stt():
+                        return await asyncio.get_event_loop().run_in_executor(None, transcribe, audio)
+                    async def _filler_tts():
+                        return await _tts_to_pcm24k(_filler)
+
+                    user_text, filler_pcm = await asyncio.gather(_stt(), _filler_tts())
                     t_stt = time.time()
                     print(f"[hybrid] STT {t_stt-t0:.1f}s: '{user_text[:40] if user_text else 'EMPTY'}'", flush=True)
-                    if not user_text: continue
+
+                    # フィラーをブラウザへ送信
+                    _CHUNK = 1920 * 4
+                    await ws.send_json({"type": "speaking", "on": True})
+                    for _i in range(0, len(filler_pcm), _CHUNK):
+                        await ws.send_bytes(filler_pcm[_i:_i+_CHUNK])
+                        await asyncio.sleep(0.075)
+
+                    if not user_text:
+                        await ws.send_json({"type": "speaking", "on": False})
+                        mute_flag["on"] = False
+                        continue
 
                     num_turns += 1; total_user_chars += len(user_text)
                     save_turn(session_id, "user", user_text)
                     await ws.send_json({"type": "user", "text": user_text})
                     await ws.send_json({"type": "status", "text": "考え中..."})
-
-                    # ← Moshiはまだ流す（LLM生成中もMoshiが喋り続ける）
-                    # 最初のPipelineオーディオが出る直前でミュート
 
                     sentence_q: queue.Queue = queue.Queue()
                     reply_container = [None]
@@ -897,9 +917,7 @@ async def _ws_hybrid(ws):
                             pcm_bytes = await _tts_to_pcm24k(sent)
                             if t_first_audio is None:
                                 t_first_audio = time.time()
-                                mute_flag["on"] = True  # Moshiをここでミュート（Pipeline音声直前）
-                                await ws.send_json({"type": "speaking", "on": True})
-                                print(f"[hybrid] 1st audio {t_first_audio-t0:.1f}s (Moshi muted)", flush=True)
+                                print(f"[hybrid] 1st audio {t_first_audio-t0:.1f}s", flush=True)
                             # 1920サンプル(80ms)ずつ送信
                             CHUNK = 1920 * 4  # float32 = 4bytes
                             for i in range(0, len(pcm_bytes), CHUNK):
