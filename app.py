@@ -335,8 +335,34 @@ def load_f5tts():
         TTS_MODE = "f5tts"
         TTS_CURRENT_MODEL = "f5tts-moshi-clone"
         print(f"✓ F5-TTS ready (ref: {_f5tts_ref_text[:30]})", flush=True)
+        # フィラー音声を事前生成してキャッシュ
+        _prewarm_fillers()
     except Exception as e:
         print(f"[f5tts] ロード失敗: {e}", flush=True)
+
+# フィラー音声キャッシュ（起動時にF5-TTSで事前生成）
+_filler_cache: dict = {}  # text → PCM bytes
+
+def _prewarm_fillers():
+    import math
+    import soundfile as sf
+    from scipy.signal import resample_poly
+    global _filler_cache
+    fillers = ["うん。", "なるほど。", "そっか。", "ふむ。", "へえ。"]
+    print("[f5tts] フィラー事前生成中...", flush=True)
+    for f in fillers:
+        try:
+            wav, sr, _ = _f5tts_model.infer(
+                ref_file=MOSHI_VOICE_SAMPLE, ref_text=_f5tts_ref_text, gen_text=f
+            )
+            audio = np.array(wav, dtype=np.float32)
+            if sr != 24000:
+                g = math.gcd(24000, int(sr))
+                audio = resample_poly(audio, 24000 // g, sr // g)
+            _filler_cache[f] = audio.astype(np.float32).tobytes()
+        except Exception as e:
+            print(f"[f5tts] filler '{f}' error: {e}", flush=True)
+    print(f"[f5tts] フィラーキャッシュ完了: {len(_filler_cache)}件", flush=True)
 
 def load_pipeline_models():
     global _lm_model, _lm_tokenizer
@@ -363,9 +389,8 @@ def load_pipeline_models():
     except Exception as e:
         print(f"[warn] Whisper warmup skipped: {e}", flush=True)
 
-    # F5-TTS: edge-tts/kokoro使用時はロードしない（メモリ競合を防ぐ）
-    if TTS_MODE == "f5tts":
-        load_f5tts()
+    # F5-TTS: 声サンプルがあれば常にロード（Moshi停止中はGPU余裕あり）
+    load_f5tts()
 
 def transcribe(audio_np):
     import mlx_whisper
@@ -808,6 +833,9 @@ async def _tts_to_pcm24k(text: str) -> bytes:
         # fallthrough to edge-tts
 
     if TTS_MODE == "f5tts" and _f5tts_model is not None:
+        # キャッシュヒット（フィラー等）
+        if text in _filler_cache:
+            return _filler_cache[text]
         try:
             def _f5():
                 wav, sr, _ = _f5tts_model.infer(
