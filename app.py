@@ -578,6 +578,26 @@ class MoshiBridge:
         self.ws_moshi = None
         self.ready = False
 
+    def pause(self):
+        """MoshiプロセスをSIGSTOPで一時停止 → GPU完全解放"""
+        import os, signal
+        if self.proc and self.proc.poll() is None:
+            try:
+                os.kill(self.proc.pid, signal.SIGSTOP)
+                print("[moshi] paused (SIGSTOP)", flush=True)
+            except Exception as e:
+                print(f"[moshi] pause error: {e}", flush=True)
+
+    def resume(self):
+        """MoshiプロセスをSIGCONTで再開"""
+        import os, signal
+        if self.proc and self.proc.poll() is None:
+            try:
+                os.kill(self.proc.pid, signal.SIGCONT)
+                print("[moshi] resumed (SIGCONT)", flush=True)
+            except Exception as e:
+                print(f"[moshi] resume error: {e}", flush=True)
+
     async def start(self, status_ws):
         await status_ws.send_json({"type": "status", "text": "日本語Moshi 起動中（数分かかります）..."})
         cmd = [sys.executable, "-m", "moshi_mlx.local_web",
@@ -915,7 +935,8 @@ async def _ws_hybrid(ws):
                 async with pipeline_lock:
                     import random as _random
                     t0 = time.time()
-                    mute_flag["on"] = True  # VAD発火でMoshi即ミュート
+                    mute_flag["on"] = True
+                    if _moshi_bridge: _moshi_bridge.pause()  # GPU完全解放
                     print(f"[hybrid] VAD triggered audio={len(audio)}", flush=True)
                     await ws.send_json({"type": "status", "text": "認識中..."})
 
@@ -996,12 +1017,14 @@ async def _ws_hybrid(ws):
                     t_done = time.time()
                     print(f"[hybrid] total {t_done-t0:.1f}s | STT:{t_stt-t0:.1f}s LLM:{(first_sentence_time[0] or t_done)-t0:.1f}s audio:{(t_first_audio or t_done)-t0:.1f}s", flush=True)
                     mute_flag["on"] = False
+                    if _moshi_bridge: _moshi_bridge.resume()  # Moshi再開
 
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 break
     finally:
         recv_task.cancel()
         mute_flag["on"] = False
+        if _moshi_bridge: _moshi_bridge.resume()
         if num_turns >= 2:
             def _extract():
                 facts = _extract_facts_sync(history)
