@@ -19,7 +19,7 @@ MOSHI_RATE   = 24000
 FRAME_SIZE   = 1920          # 80ms @ 24kHz
 VAD_SILENCE  = 0.8       # 発話終了判定を短縮（1.5→0.8秒）
 VAD_THRESH   = 0.015
-MLX_LM_REPO  = "mlx-community/Qwen3-8B-4bit"  # 8B (4GB) Moshi+Whisperと共存
+MLX_LM_REPO  = "mlx-community/Qwen3.5-122B-A10B-4bit"  # 122B MoE (10B active)
 WHISPER_REPO = "mlx-community/whisper-large-v3-turbo"  # turbo版（large-v3の5x高速）
 TTS_VOICE    = "ja-JP-NanamiNeural"
 TTS_MODE     = "kokoro"   # "edge-tts" | "kokoro" | "f5tts"
@@ -876,8 +876,8 @@ async def _ws_hybrid(ws):
             if msg.type == aiohttp.WSMsgType.BINARY:
                 pcm = np.frombuffer(msg.data, dtype=np.float32)
 
-                # Moshiへ常時送信
-                if _moshi_bridge and _moshi_bridge.ready:
+                # Moshiへ送信（Pipeline処理中は止めてGPUを解放）
+                if _moshi_bridge and _moshi_bridge.ready and not mute_flag["on"]:
                     await asyncio.get_event_loop().run_in_executor(None, _moshi_bridge.feed_pcm, pcm)
 
                 if mute_flag["on"] or pipeline_lock.locked(): continue
